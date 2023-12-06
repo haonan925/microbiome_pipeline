@@ -1,0 +1,1078 @@
+---
+title: "菌群分析指南"
+author: "杨云浩男"
+date: "`r Sys.Date()`"
+output:
+  rmdformats::readthedown:
+    code_folding: show
+    self_contained: true
+    thumbnails: false
+    lightbox: true
+    highlight: kate
+    toc_depth: 3
+    number_sections: true
+pkgdown:
+  as_is: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE)
+```
+
+# 前言 {.unnumbered}
+
+这是杨云浩男在华西二医院流行病学与人群健康实验室分享的菌群分析资料。 本文档使用了其它网页和公开课的例子， 仅供学生内部使用，不公开。**本文档会不断补充新内容（包括已讲部分）。** 鉴于本人水平有限， 错漏之处难免， 欢迎指出错误或提出改进意见。
+
+使用本教程必须安装的R软件包：
+
+-   dplyr 数据清洗
+-   reshape2 数据重塑
+-   stringr 字符串处理
+-   ggplot2 绘图
+-   ggrepel 标注文本
+-   plot3D 绘图3d
+-   vegan 微生物群落分析
+-   caret 机器学习
+-   glmnet 弹性网和LASSO
+-   pROC 预测评价
+-   doParallel 并行计算**（windows）**
+-   openxlsx 读取Excel文件
+
+编译本教程所用的R软件环境：
+
+```{r}
+devtools::session_info()
+```
+
+# 数据准备
+
+一般各位拿到的数据是物种分类表，有时也会是ASV表。 物种分类表（OTU）包括按界（Kingdom）、门（Phylum）、纲（Class）、目（Order）、科 （Family）、属（Genus）、种（Species）的计数或相对丰度。 ASV表为每个序列变体（可以理解为比Species更细致的分类单位）的计数或相对丰度，可基于此进一步分析或转为物种分类表。
+
+16S数据由于其检测方法，一般需要作为成分数据分析，即进行抽平或转化为相对丰度。这里我们使用西湖大学两批次的16S物种分类计数数据进行演示。
+
+```{r include=FALSE}
+library(dplyr)
+library(reshape2)
+library(openxlsx)
+library(stringr)
+library(vegan)
+library(pairwiseAdonis)
+library(ggplot2)
+library(ggrepel)
+library(plot3D)
+library(glmnet)
+library(caret)
+library(pROC)
+library(doParallel)
+```
+
+## 丰度分布图
+
+本节选择相对丰度前10的属，分三期绘制堆叠柱状图。
+
+```{r}
+# 出于后续运行速度的考虑，选择数据中的batch=2
+otu_tab = read.xlsx('data/物种注释16S（早期+三期）.xlsx') %>% filter(batch==2)
+# otu_tab = read.xlsx('data/物种注释16S（早期+三期）.xlsx')
+micro_info = read.xlsx('data/菌群基本信息16S.xlsx')
+# 选择genus水平数据，g开头的列
+count_tab = otu_tab %>% select(matches('^g\\d+'))
+# 计算相对丰度
+abund_tab = decostand(count_tab, 'total', 1)
+# 选择相对丰度前10的属，分三期绘制堆叠柱状图
+abund_mean = colMeans(abund_tab)
+micro_sel = names(abund_mean)[order(abund_mean, decreasing = T)[1:10]]
+# 计算每期相对丰度
+df = cbind(otu_tab %>% select(period), abund_tab %>% select(all_of(micro_sel))) %>% 
+  group_by(period) %>% summarise(across(where(is.numeric), mean))
+df$others = 1- rowSums(df %>% select(2:11))
+# 整理数据格式，并绘图
+df = melt(df, id.vars = 1) %>% left_join(micro_info, by=c('variable'='ID')) %>% 
+  mutate(name = ifelse(variable=='others', variable, name))
+df$name = factor(df$name, levels = rev(unique(df$name))) #按当前顺序的倒序
+p = ggplot(df, aes(x=period, y = value, fill = name))+
+  geom_bar(stat="identity", position="stack", width = 0.7)
+p
+```
+
+进行一些美化，包括图例调整顺序和颜色，修改横、纵坐标和图例的标题，修改主题等。
+
+```{r}
+genus_col = RColorBrewer::brewer.pal(11, "Set3")
+p + scale_fill_manual(limits = rev(unique(df$name)), values = genus_col)+
+  labs(x='', y='Relative abundance', fill='Genus')+
+  theme_bw()
+```
+
+## 物种筛除
+
+一般在分析前可筛除低丰度物种，这里展示两种方式（比例可调整）：
+
+1.  删除所有样本中平均相对丰度\< 0.01%的分类单元
+2.  删除至少50%样本中未测出的分类单元
+
+```{r}
+micro_sel1 = names(which(abund_mean > 1e-4)) # 146
+micro_sel2 = names(which(colMeans(count_tab>0) > 0.5)) # 76
+# 后续以micro_sel1为准
+count_tab = count_tab %>% select(all_of(micro_sel1))
+```
+
+# 多样性分析
+
+部分多样性计算方法依赖由序列生成的进化树，涉及其他软件的使用，将在第三次课补充。
+
+## Alpha多样性
+
+此部分更详细的介绍可参考：
+
+1.  [Alpha多样性指数](https://zhuanlan.zhihu.com/p/74783516)
+2.  [Alpha多样性箱线图](https://mp.weixin.qq.com/s?__biz=MzUzMjA4Njc1MA==&mid=2247490444&idx=1&sn=a257eef7b25110cf402cd995eb74778e)
+3.  [Alpha多样性稀释曲线](https://mp.weixin.qq.com/s?__biz=MzUzMjA4Njc1MA==&mid=2247490732&idx=1&sn=d8bf154541f8116d3757aa876215d5e7)
+
+$\alpha$多样性，即样本内多样性。常用的度量指标有：
+
+-   Chao1（Chao1 richness estimator）：利用群落中只检测到1次和2次的OTU数估计群落中实际存在的物种数。 $$
+    Chao1=n_{obs}+n_1(n_1-1)/(n_2+1)
+    $$ 其中$n_{obs}$ 为观测到的OTU数，$n_1$为只有一条序列的OTU数目，$n_2$为只有两条序列的OTU数目。
+
+-   **香农 - 威纳多样性指数（Shannon-wiener diversity index）**： $$
+    H=-\sum\limits_{i=1}^n p_i \ln p_i
+    $$ 其中$p_i$为相对丰度，通常以2为底数。
+
+-   Pielou均匀度指数（Pielou's Evenness Index）： $$
+    J = \frac{H}{\ln n_{obs}}
+    $$
+
+-   **辛普森多样性指数（Simpson diversity index）**：随机取两个种属于不同种的概率。 $$
+    D=1-\sum\limits_{i=1}^n p_i^2
+    $$
+
+-   谱系多样性/系统发育多样性（faith-pd）：需要进化树，未来讲。
+
+以下计算Genus-level的$\alpha$多样性，注意有的文章会拉通所有level计算，但不建议这样做。
+
+```{r}
+Chao1 = estimateR(count_tab)
+# diversity()会自动计算为相对丰度
+H = diversity(count_tab, "shannon", base = 2)
+# abund_tab = decostand(count_tab, 'total', 1)
+# H2 = diversity(abund_tab, "shannon", base = 2)
+# range(H - H2)
+J = H/log(Chao1[1,], base = 2)
+D = diversity(count_tab, "simpson")
+```
+
+根据研究假设，将$\alpha$多样性指标作为暴露、结局或其他类型的变量可进行常规的流行病学分析。作图以分组的箱式图为主，[稀释曲线](https://mp.weixin.qq.com/s?__biz=MzUzMjA4Njc1MA==&mid=2247490732&idx=1&sn=d8bf154541f8116d3757aa876215d5e7)现在使用不多，感兴趣的同学可自学。
+
+## Beta多样性
+
+此部分更详细的介绍可参考：
+
+1.  [PCA、PCoA与NMDS区别](https://zhuanlan.zhihu.com/p/180284720)
+2.  [PCA与PCoA原理](https://zhuanlan.zhihu.com/p/632396377)
+3.  [RDA原理](https://www.jianshu.com/p/1a2656d06114)、[CCA原理](https://www.cnblogs.com/pinard/p/6288716.html)和[RDA和CCA结果解释](https://www.davidzeleny.net/anadat-r/doku.php/en:rda_cca)
+4.  [ADONIS、ANOSIM、Mantel test与MRPP原理](https://blog.csdn.net/qq_42458954/article/details/110390488)
+5.  [PCA/PCoA相关统计检验](https://zhuanlan.zhihu.com/p/462147420)
+
+$\beta$多样性，即样本间多样性。
+
+### 样本间距离
+
+衡量$\beta$多样性大小，即两样本在物种组成上的相似度/距离。常用的距离有：
+
+-   Euclidean 距离
+-   **Bray-Curtis距离**： $$
+    d_{jk} = \sum\limits_{i=1}^n |x_{ji}-x_{ki}| / \sum\limits_{i=1}^n (x_{ji}+x_{ki})
+    $$ 其中$x_{ji}$表示第$j$个样本的第$i$个OTU的比例或数量。
+-   Jaccard 相似度： $$
+    J = \frac{A \cap B}{A \cup B}
+    $$ 其中$A$和$B$分别表示两样本中的OTU种类。
+-   Unweighted / weighted Unifrac 距离：需要进化树，未来讲。
+
+以下计算Genus-level的样本两两距离，注意有的文章会拉通计算所有level，但不建议这样做。
+
+```{r}
+abund_tab = decostand(count_tab, 'total', 1)
+bray_dist = vegdist(abund_tab, 'bray')
+# euclidean_dist = vegdist(abund_tab, 'euclidean')
+# jac_dist = vegdist(abund_tab, 'jaccard')
+```
+
+### 非限制性排序
+
+仅使用OTU表进行降维，而不使用其他变量。主要方法有：
+
+-   PCA：等同于使用欧氏距离进行PCoA。
+-   **PCoA（principal co-ordinates analysis， 主坐标分析）**：主要思想是用欧氏距离反映任意距离。原理可参考：[PCA与PCoA原理](https://zhuanlan.zhihu.com/p/632396377)
+-   **NMDS（Non-metric multidimensional scaling，非度量多维标度分析法）**：不同于PCoA，NMDS弱化了对实际距离数值的依赖，更加强调数值间的排名（秩次）。
+
+#### PCoA
+
+以之前计算的 Bray-Curtis 距离为例，进行主坐标分析，选择解释度最大的两个维度绘图。绘图需标出各成分贡献度。
+
+```{r fig.height = 6, fig.width = 6, fig.align = 'center'}
+pcoa = cmdscale(bray_dist, k = 3, eig = TRUE) # 保存前3维坐标
+contr = pcoa$eig/sum(pcoa$eig) * 100 # 计算贡献度
+
+# 绘制分孕期图
+ptColors = c("#FFC107","#2E5266","#F44336")
+colnames(pcoa$points) = c('PCOA1', 'PCOA2', 'PCOA3')
+df_pca = cbind(otu_tab %>% select(id, period), pcoa$points[,1:3])
+ggplot(df_pca, aes(x=PCOA1, y=PCOA2))+
+  stat_ellipse(aes(color = period, fill = period), geom = "polygon",level = 0.95,
+               linetype = 1, linewidth=1, alpha = 0.2)+
+  geom_point(aes(color = period), size=1.5, alpha=0.8, shape = 16)+
+  scale_colour_manual(values=ptColors)+
+  scale_fill_manual(values=ptColors)+
+  labs(x=sprintf('PCOA1 (%.1f%%)', contr[1]), 
+       y=sprintf('PCOA2 (%.1f%%)', contr[2]))+
+  theme_bw()
+```
+
+以同样的降维结果，选择解释度最大的三个维度绘图。
+
+```{r, fig.height = 6.8, fig.width = 7.5, fig.align = 'center'}
+# library(plot3D)
+ptColors = c("#FFC107","#2E5266","#F44336")
+# 设置点透明度0.8
+plot_col = paste0(ptColors, as.hexmode(round(255*0.8)))[as.numeric(factor(df_pca$period))]
+scatter3D(x = df_pca$PCOA1, y = df_pca$PCOA2, z = df_pca$PCOA3, 
+          bg = plot_col, 
+          xlab = sprintf('PCOA1 (%.1f%%)', contr[1]),
+          ylab = sprintf('PCOA2 (%.1f%%)', contr[2]),
+          zlab = sprintf('PCOA3 (%.1f%%)', contr[3]), 
+          pch = 21, cex = 1.2, col = 'black', alpha = 0.2, 
+          ticktype = "detailed", bty = "b2", 
+          theta = 45, phi = 15, d = 2)
+legend("right", title = "Period",legend=c("V1", "V2", "V3"),
+       pch=21, cex=1, pt.cex = 1.2, y.intersp=1.1, 
+       pt.bg = ptColors, bg="white", bty="n")
+```
+
+#### NMDS
+
+以之前计算的 Bray-Curtis 距离为例，进行NMDS分析，降为2个维度。3个维度的自行尝试。该函数运行会比较慢。
+
+```{r}
+# 也可设置k=3，绘制3维图像
+# try和trymax为最小、最大迭代次数，默认为20，考虑运行速度这里设置为5
+nmds = metaMDS(bray_dist, k = 2, try = 5, trymax = 5) # 降维为2维
+```
+
+**检查stress值**，stress\< 0.1为表示模型可以被接受，数值越接近0模型效果越好。类比PCoA各成分的贡献度，表示降维效果。
+
+```{r}
+nmds
+```
+
+该模型效果不好，可以考虑用3个维度分析，或换其他降维方法。绘图需标出stress值。
+
+```{r fig.height = 5, fig.width = 5.5, fig.align = 'center'}
+df_nmds = cbind(otu_tab %>% select(id, period), nmds$points[,1:2])
+ggplot(df_nmds, aes(x=MDS1, y=MDS2))+
+  stat_ellipse(aes(color = period, fill = period), geom = "polygon",level = 0.95,
+               linetype = 1, linewidth=1, alpha = 0.2)+
+  geom_point(aes(color = period), size=1.5, alpha=0.8, shape = 16)+
+  scale_colour_manual(values=ptColors)+
+  scale_fill_manual(values=ptColors)+
+  annotate('text', x=-0.75, y = -1.6, label=sprintf('stress=%.3f', nmds$stress))+
+  labs(x='NMDS1', y='NMDS2')+
+  coord_fixed() + theme_bw()
+```
+
+### 限制性排序
+
+使用OTU表（X）和其他变量（Y）进行降维，可理解为一种监督学习/预测模型。**不一定**使用Beta多样性的距离矩阵，可用相对丰度/抽平/CLR变换（见差异分析）的OTU表进行降维。主要方法有：
+
+-   **RDA（redundancy analysis，冗余分析）**：同时结合了降维和回归分析。原理可参考：[RDA原理](https://www.jianshu.com/p/1a2656d06114)和[RDA原理和例子](https://www.davidzeleny.net/anadat-r/doku.php/en:rda_cca)
+-   **CCA（canonical correspondence analysis，典范对应分析）**：同时结合了降维和相关性分析，可理解为每次分离出X的线性组合与Y的线性组合中相关性最大的部分。原理可参考：[CCA原理](https://www.cnblogs.com/pinard/p/6288716.html)
+-   **LDA（linear discriminant analysis，线性判别分析）**：最大化组间距离，最小化组内方差。[LDA原理](https://zhuanlan.zhihu.com/p/79696530)。当Y均是分类变量时，CCA即为LDA，见[CCA与LDA关系](https://journals.ametsoc.org/view/journals/atsc/25/1/1520-0469_1968_025_0023_ccairt_2_0_co_2.xml)
+
+可以先用DCA（一种非限制性排序方法）判断数据适合RDA还是CCA。
+
+```{r}
+decorana(abund_tab)
+```
+
+如果DCA1的Axis lengths \> 4.0，就应选CCA（基于单峰模型)；如果在3.0-4.0之间，选RDA和CCA均可；如果小于3.0, RDA的结果会更合适（基于线性模型）。因此本例选择RDA更合适。
+
+#### RDA
+
+使用微生物相对丰度和孕期进行冗余分析。此处设置`scale = FALSE`是因为相对丰度量纲相同，其实际大小有意义，是否需要标准化与PCA中的原则一致。此外，该分析可控制协变量Z，见`?rda`。
+
+```{r}
+rda_rlt = rda(abund_tab, factor(otu_tab$period), scale = F)
+rda_rlt
+```
+
+`Constrained Proportion`是与Y有关的部分占总方差的比例，为0.0276，可理解为微生物的差异有2.76%可由孕期解释。具体每个成分的贡献度可使用`summary()`提取。
+
+```{r}
+contr = summary(rda_rlt)$cont$importance
+contr[,1:4] # 查看前4维
+```
+
+注意因为Y是2维，结果中只有前2维是总方差由与Y有关的部分解释的，其余部分与Y无关。使用前2维绘图，因为分离出了与Y最相关的部分，图形显示的分类更有差异。
+
+```{r fig.height = 4.8, fig.width = 5.5, fig.align = 'center'}
+# 若Y只有一个维度，需要修改绘图的y为PC1
+df_rda = cbind(otu_tab %>% select(id, period), summary(rda_rlt)$sites)
+ggplot(df_rda, aes(x=RDA1, y=RDA2))+
+  stat_ellipse(aes(color = period, fill = period), geom = "polygon",level = 0.95,
+               linetype = 1, linewidth=1, alpha = 0.2)+
+  geom_point(aes(color = period), size=1.5, alpha=1, shape = 16)+
+  scale_colour_manual(values=ptColors)+
+  scale_fill_manual(values=ptColors)+
+  labs(x=sprintf('RDA1 (%.1f%%)', contr[2,1]*100), 
+       y=sprintf('RDA2 (%.1f%%)', contr[2,2]*100))+
+  theme_bw()
+```
+
+#### CCA
+
+出于演示，使用微生物相对丰度和孕期进行典型对应分析。结果解释与RDA类似。此处无需设置`scale`参数是因为，计算相关系数一定会进行标准化。此外，该分析可控制协变量Z，见`?cca`。
+
+```{r}
+cca_rlt = cca(abund_tab, factor(otu_tab$period))
+cca_rlt
+```
+
+同样地，可使用`summary(cca_rlt)$cont$importance`提取各维度贡献度。注意因为Y是2维，结果中前2维是总方差由与Y有关的部分解释的，其余部分与Y无关。使用前2维绘图。
+
+```{r fig.height = 4.8, fig.width = 5.5, fig.align = 'center'}
+# 若Y只有一个维度，需要修改绘图的y为PC1
+df_cca = cbind(otu_tab %>% select(id, period), summary(cca_rlt)$sites)
+ggplot(df_cca, aes(x=CCA1, y=CCA2))+
+  stat_ellipse(aes(color = period, fill = period), geom = "polygon",level = 0.95,
+               linetype = 1, linewidth=1, alpha = 0.2)+
+  geom_point(aes(color = period), size=1.5, alpha=1, shape = 16)+
+  scale_colour_manual(values=ptColors)+
+  scale_fill_manual(values=ptColors)+
+  labs(x=sprintf('CCA1 (%.1f%%)', contr[2,1]*100), 
+       y=sprintf('CCA2 (%.1f%%)', contr[2,2]*100))+
+  theme_bw()
+```
+
+#### db-RDA
+
+以上分析中均使用相对丰度表，但RDA方法也可基于距离（distance based）矩阵分析。结果解释是类似的。
+
+```{r}
+dbrda_rlt = dbrda(abund_tab ~ period, data = otu_tab, distance = 'bray')
+dbrda_rlt
+```
+
+同样可绘制图形，效果不错。
+
+```{r fig.height = 4.8, fig.width = 5.5, fig.align = 'center'}
+contr = summary(dbrda_rlt)$cont$importance
+# 注意若Y只有一个维度，需要修改绘图的y为MDS1
+df_dbrda = cbind(otu_tab %>% select(id, period), summary(dbrda_rlt)$sites)
+ggplot(df_dbrda, aes(x=dbRDA1, y=dbRDA2))+
+  stat_ellipse(aes(color = period, fill = period), geom = "polygon",level = 0.95,
+               linetype = 1, linewidth=1, alpha = 0.2)+
+  geom_point(aes(color = period), size=1.5, alpha=1, shape = 16)+
+  scale_colour_manual(values=ptColors)+
+  scale_fill_manual(values=ptColors)+
+  labs(x=sprintf('dbRDA1 (%.1f%%)', contr[2,1]*100), 
+       y=sprintf('dbRDA2 (%.1f%%)', contr[2,2]*100))+
+  theme_bw()
+```
+
+### 多元方差分析
+
+根据研究假设，该部分方法可用于评价：
+
+1.  单个变量与$\beta$多样性的相关性
+2.  多个变量与$\beta$多样性的相关性
+3.  多组变量对$\beta$多样性的解释度
+
+主要方法有：
+
+-   **PERMANOVA（permutational multivariate analysis of variance，置换多元方差分析）**：类似于方差分析，对距离组成进行分解，适用于分类变量。常与PCoA图结合。原理可参考：[ADONIS、ANOSIM、Mantel test与MRPP原理](https://blog.csdn.net/qq_42458954/article/details/110390488)
+-   **ANOSIM（analysis of similarities，相似度分析）**：类似于PERMANOVA，但使用秩次统计量，适用于分类变量/组别。常与NMDS图结合。
+-   MRPP（multi-response permutation procedure）：类似于PERMANOVA，但使用另一种统计量。使用较少。
+-   **Mantel test**：计算两个距离矩阵的相关性并进行检验，适用于连续变量和多个变量。PCoA、NMDS、RDA和CCA等均可使用。原理可参考：[Mantel test原理](https://uw.pressbooks.pub/appliedmultivariatestatistics/chapter/mantel-test/)
+-   **VPA（variation partition analysis，方差分解分析）**：计算多组变量对$\beta$多样性的解释度，适用于分类变量、连续变量和多组变量。PCoA、NMDS、RDA和CCA等均可使用。
+
+以上分析均通过置换检验给出p值，需要注意`vegan`包中置换检验默认999次，最低p值为0.001。 记置换次数为$N$，其中超过观察到的检验统计量次数为$n$，则$p-value = \frac{n+1}{N+1}$。如果样本量较大，而总置换次数不多，很容易出现$n=0$，即结果为$p-value = \frac{1}{N+1}$。在多重检验中发生p值都为最小值的情况很常见。
+
+#### PERMANOVA / Adonis
+
+肉眼看PCoA图，不同孕期间似乎有区别，可通过PERMANOVA给出p值。考虑运行时间，例子中置换99次。
+
+```{r}
+# 使用距离矩阵，置换100次，并行
+beta_test = adonis2(bray_dist ~ period, data = otu_tab, permutations = 99, parallel = 8)
+beta_test
+# 也可使用相对丰度矩阵
+# beta_test = adonis2(abund_tab ~ period, data = otu_tab, permutations = 99, method="bray", parallel = 8)
+```
+
+多组差异的两两检验可使用`pairwiseAdonis`包的`pairwise.adonis()`。
+
+```{r}
+# library(pairwiseAdonis)
+# 使用距离矩阵
+beta_pair_test = pairwise.adonis(bray_dist, factors=otu_tab$period,
+                                 p.adjust.m = "fdr", # 多重检验方法
+                                 perm = 99) # 置换次数
+beta_pair_test
+# # 也可使用相对丰度矩阵
+# beta_pair_test2 = pairwise.adonis(abund_tab, factors=otu_tab$period,
+#                                   sim.function = 'vegdist', # 计算距离的函数
+#                                   sim.method = 'bray', # 距离方法 
+#                                   p.adjust.m = "fdr", # 多重检验方法
+#                                   perm = 99) # 置换次数
+```
+
+以上检验任何两组间差异显著（并且都为最小p值），我们随机分组，看一个差异不显著的例子。
+
+```{r}
+otu_tab$period_random = sample(c('V1','V2','V3'), prob = c(0.4, 0.3, 0.3), size = nrow(otu_tab), replace = T)
+beta_pair_test_random = pairwise.adonis(bray_dist, factors=otu_tab$period_random,
+                                        p.adjust.m = "fdr", # 多重检验方法
+                                        perm = 99) # 置换次数
+beta_pair_test_random
+```
+
+#### ANOSIM
+
+肉眼看NMDS图，不同孕期间似乎有区别，可通过ANOSIM给出p值。考虑运行时间，例子中置换99次。
+
+```{r}
+beta_test = anosim(bray_dist, otu_tab$period, permutations = 99, parallel = 8)
+beta_test
+```
+
+结果解读类似于PERMANOVA，两两比较需要自行写程序，已提供在example中。
+
+#### MRPP
+
+使用方法类似于PERMANOVA，两两比较需要自行写程序，可参考提供ANOSIM两两比较进行修改。
+
+```{r}
+beta_test = mrpp(bray_dist, otu_tab$period, permutations = 99, parallel = 8) 
+beta_test
+```
+
+#### Mantel test
+
+该方法最好用于连续变量，若用于有序分类变量，可使用以下步骤。分组变量使用euclidean距离，距离矩阵间的相关性使用person相关系数。
+
+```{r}
+group_dist = dist(as.numeric(as.factor(otu_tab$period)), method = "euclidean")
+# 距离矩阵间的相关性使用person相关系数，也可使用spearman/kendall
+beta_test = mantel(bray_dist, group_dist, permutations=99, method="pearson")
+beta_test
+```
+
+结果中`Mantel statistic r`为两距离矩阵的相关性，可理解为两组变量的相关性，即genus与孕期分组的相关性。类比以上步骤，可计算微生物与代谢组的相关性、微生物与蛋白组的相关性及微生物与某些危险因素的相关性等。`Significance`为显著性p值。
+
+注意该方法可调整协变量Z，称为 **partial Mantel test**，见`?mantel.partial`，需要先计算协变量的距离矩阵`zdis`。结果解释与 Mantel test类似。
+
+#### VPA
+
+使用`vegan`包的`varpart()`分解方差或距离的成分。回忆方差分析中的[I、II和III型误差平方和](https://mcfromnz.wordpress.com/2011/03/02/anova-type-iiiiii-ss-explained/)，某些类型的方差分解会因为解释变量的顺序改变而变化。在VPA分析中也类似，`varpart()`提供了最多4个成分的I和II型分解。结果`Adj.R.squared`解释为各部分的主效应和交互效应。
+
+*这也是PERMANOVA中使用`adonis2()`的原因，需要分解与变量顺序无关。*
+
+加入ICP诊断信息，将**相对丰度**分解为由孕期和ICP可解释的部分。
+
+```{r}
+# 加入ICP诊断信息
+base_info = readRDS('data/ICP_baseline_info.rds')
+explan_var = otu_tab %>% select(id, period) %>% 
+  left_join(base_info %>% select(id, ICP), by = 'id') %>% 
+  mutate(ICP = ifelse(is.na(ICP), 0, ICP)) # 诊断缺失填补为0
+# 分解相对丰度为由孕期、ICP可解释的部分
+vpa_rlt = varpart(abund_tab, ~ period, ~ ICP, data = explan_var)
+vpa_rlt
+```
+
+该方法基于RDA，以下程序可证明两者的等价性。
+
+```{r collapse=TRUE}
+# 结果与RDA结果一致
+rda_fit = rda(abund_tab ~ period + Condition(ICP), data = explan_var)
+RsquareAdj(rda_fit)$adj.r.squared # 提取period主效应[a]
+rda_fit = rda(abund_tab ~ ICP + Condition(period), data = explan_var)
+RsquareAdj(rda_fit)$adj.r.squared # 提取ICP主效应[b]
+```
+
+类似地，也可将**距离矩阵**分解为由孕期和ICP可解释的部分。解释为将$\beta$多样性分解为由孕期和ICP可解释的部分。
+
+```{r}
+# 分解距离矩阵为由孕期、ICP可解释的部分
+vpa_dist = varpart(bray_dist, ~ period, ~ ICP, data = explan_var)
+vpa_dist
+```
+
+该方法基于db-RDA，以下程序可证明两者的等价性。
+
+```{r collapse=TRUE}
+# 结果与db-RDA结果一致
+rda_fit = dbrda(bray_dist ~ period + Condition(ICP), data = explan_var)
+RsquareAdj(rda_fit)$adj.r.squared # 提取period主效应[a]
+rda_fit = dbrda(bray_dist ~ ICP + Condition(period), data = explan_var)
+RsquareAdj(rda_fit)$adj.r.squared # 提取ICP主效应[b]
+```
+
+### 离散度评价
+
+多元方差分析类似于方差分析，常需要假设方差齐性，即不同组数据的离散度差别不能太大。因为组间的差异可能来自组中心点的差异，或组离散程度的差异。如果离散程度差距不大，结果可以解释为不同组的中心点的差距。
+
+评价$\beta$多样性距离在不同孕期分组间的离散度差异。
+
+```{r}
+# 评估离散程度
+dispersion = betadisper(bray_dist, group=otu_tab$period)
+permutest(dispersion, permutations = 999) # 置换检验得到p值
+```
+
+组间离散度有显著差别，因此组间的$\beta$多样性差异可能来自两方面。
+
+# 差异分析
+
+目的是找到与结局密切相关的微生物，在分析前常进行数据变换。更多介绍可参考：[微生物数据变换与差异分析](https://www.nature.com/articles/s41522-020-00160-w)
+
+本节将使用孕早期所有batch的数据，筛选ICP有关的差异微生物。
+```{r collapse=TRUE}
+otu_tab = read.xlsx('data/物种注释16S（早期+三期）.xlsx') %>% filter(period=='V1')
+micro_info = read.xlsx('data/菌群基本信息16S.xlsx')
+# 选择genus水平数据，g开头的列
+count_tab = otu_tab %>% select(matches('^g\\d+'))
+# 计算相对丰度均值，筛选物种
+abund_mean = colMeans(decostand(count_tab, 'total', 1))
+micro_sel = names(which(abund_mean > 1e-4)) # 147
+count_tab = count_tab %>% select(all_of(micro_sel1))
+# 读取ICP诊断和部分协变量的数据
+base_info = readRDS('data/ICP_baseline_info.rds')
+explan_var = otu_tab %>% select(id, period) %>% 
+  left_join(base_info %>% select(id, ICP, age, BMI_prep, smk, drk, edu)) %>% 
+  mutate(ICP = ifelse(is.na(ICP), 0, ICP)) # ICP诊断缺失填补为0
+colMeans(is.na(explan_var)) 
+# 缺失比例不多，连续变量用均值填补，分类变量用众数(0)填补
+explan_var = explan_var %>% mutate_at(c('age', 'BMI_prep'), Hmisc::impute, fun=mean) %>% 
+  mutate_at(c('smk', 'drk', 'edu'), Hmisc::impute, 0)
+# str(explan_var)
+```
+
+## 数据变换
+
+常见的数据变换方式有：
+
+-   相对丰度：使用相对丰度直接分析。
+-   **CLR（centered log ratio，中心对数比）变换**：$$clr(x_i) = \log \frac{x_i}{g(\mathbb x)}$$ 其中$\mathbb x$表示计数矩阵，$g(\mathbb x)$为$\mathbb x$的几何均数。如果存在0值，一般的处理方法是计数矩阵每个位置+1。
+-   robust CLR变换：$$rclr(x_i) = \log \frac{x_i}{g_{>0}(\mathbb x)}$$ 其中$g_{>0}(\mathbb x)$为$\mathbb x$中大于0的部分的几何均数。如果存在0值，rlcr变换的结果定义为0（相当于将计数表中的0填补为几何均数）。
+-   arcsin变换： $$
+    \arcsin (p_i)
+    $$
+    其中$p_i$为OTU $i$的相对丰度。 
+
+- arcsin square root变换： $$
+  \arcsin (\sqrt p_i)
+  $$ 
+  
+- log Z 变换：常见于代谢组和蛋白组。
+
+```{r}
+abund_tab = decostand(count_tab, 'total', 1) # 相对丰度
+clr_tab = decostand(count_tab, 'clr', 1, pseudocount = 1) # clr
+rclr_tab = decostand(count_tab, 'rclr', 1) # rclr
+asin_tab = asin(abund_tab) # arcsin
+asin_sqrt = asin(sqrt(abund_tab)) # arcsin square root
+```
+
+需要注意`compositions`包的`clr()`在数据存在0时为rclr，不存在0时为clr。
+```{r collapse=TRUE}
+clr_tab2 = compositions::clr(count_tab+1)
+range(clr_tab - as.matrix(clr_tab2)) # 一致
+rclr_tab2 = compositions::clr(count_tab)
+range(rclr_tab - as.matrix(rclr_tab2)) # 一致
+```
+
+
+## 单维统计
+
+经过数据变换后，将每个微生物作为暴露因素，考虑**数据类型**和**研究设计**，进行常规的流行病学分析。 
+
+这里以clr变换的结果为例，忽略选择偏倚，给出**非配对**数据的t检验、wilcoxon秩和检验与logistic回归的例子。*鼓励大家选择更多分析方法*。
+
+将检验方法整理为函数，便于修改检验方法或并行程序。
+```{r}
+my.t.test <- function(expo, outcome, data){
+  rule = paste(expo,'~', outcome)
+  fit = t.test(as.formula(rule), data, var.equal = FALSE)
+  beta = diff(fit$estimate)
+  pv = fit$p.value
+  return(c(expo, beta, pv))
+}
+my.wilcox.test <- function(expo, outcome, data){
+  rule = paste(expo,'~', outcome)
+  fit = wilcox.test(as.formula(rule), data, correct = FALSE)
+  beta = diff(aggregate(as.formula(rule), data, mean)[,2])
+  pv = fit$p.value
+  return(c(expo, beta, pv))
+}
+my.logistic <- function(expo, outcome, cov_name, data){
+  rule = paste(outcome,'~', expo, '+', str_flatten(cov_name,'+'))
+  fit = glm(as.formula(rule), data, family = binomial())
+  fit_summ = summary(fit)
+  beta = fit_summ$coefficients[2, 'Estimate']
+  pv = fit_summ$coefficients[2, 'Pr(>|z|)']
+  return(c(expo, beta, pv))
+}
+```
+
+我们主要展示logistic回归的结果。
+```{r collapse=TRUE}
+data16s = cbind(explan_var, clr_tab) # 也可尝试其他变换
+micro_name = colnames(clr_tab)
+cov_name = c('age', 'BMI_prep', 'smk', 'drk', 'edu')
+# 非并行 logistic regression
+diff_tab = c()
+for (microi in micro_name){
+  diff_tab = rbind(diff_tab, my.logistic(microi, 'ICP', cov_name, data16s))
+  # diff_tab = rbind(diff_tab, my.t.test(microi, 'ICP', data16s))
+  # diff_tab = rbind(diff_tab, my.wilcox.test(microi, 'ICP', data16s))
+}
+diff_tab = data.frame(diff_tab)
+names(diff_tab) = c('micro_name','beta','pv')
+diff_tab = diff_tab %>% mutate_at(c('beta','pv'), as.numeric) %>% arrange(pv)
+# 多重检验矫正
+diff_tab$pv_adj_FWER = p.adjust(diff_tab$pv, 'bonferroni')
+diff_tab$pv_adj_FDR = p.adjust(diff_tab$pv, 'fdr')
+diff_tab$abs_beta = abs(diff_tab$beta)
+head(diff_tab)
+# 补充物种名称信息
+diff_tab = diff_tab %>% left_join(micro_info, by=c('micro_name'='ID'))
+```
+
+常见的描述差异微生物的方式为火山图，但也有很多其他图形绘制，多看文章。
+```{r fig.height = 4, fig.width = 4, fig.align = 'center'}
+cut.pv = 0.05 # p值截断
+cut.beta = 0.05 # beta值截断
+df = diff_tab %>% mutate(col = case_when(pv_adj_FDR < cut.pv & beta > cut.beta ~ 'up',
+                                         pv_adj_FDR < cut.pv & beta < -cut.beta ~ 'down', 
+                                         .default = 'notsig'),
+                         text = case_when(pv_adj_FDR < cut.pv & abs_beta > cut.beta ~ name,
+                                          .default = NA))
+
+ggplot(df, aes(x=beta, y= -log10(pv_adj_FDR)))+
+  geom_hline(yintercept = -log10(cut.pv), lty = 2, color = 'grey50')+
+  geom_vline(xintercept = c(-cut.beta, cut.beta), lty = 2, color = 'grey50')+
+  geom_point(aes(color = col), shape = 16, size = 2)+
+  geom_text_repel(aes(label=text), size = 2)+
+  scale_color_manual(values = c("coral", "lightblue", "grey80"),
+                     breaks = c("up", 'down' ,'nosig'))+
+  scale_x_continuous(limits = c(-0.3, 0.3), breaks = round(seq(-0.3,0.3,0.1),1))+
+  scale_y_continuous(limits = c(0, 4), breaks = seq(0,4,1))+
+  labs(x='Beta',y='-Log10(adjusted p value)')+
+  theme_bw()+
+  theme(plot.title = element_text(hjust = 0.5),
+        legend.position = 'none',
+        panel.grid= element_blank())
+```
+
+下方使用所有level的微生物数据进行分析，并保存结果在同一个excel文件。注意`foreach`并行仅在windows系统中有效。程序较长，可点右侧**hide**跳过。
+```{r}
+# 筛选物种，数据变换
+data16s = explan_var
+for (level in c('p','c','o','f','g')){
+  count_tab = otu_tab %>% select(matches(paste0('^',level,'\\d+')))
+  abund_mean = colMeans(decostand(count_tab, 'total', 1))
+  micro_sel = names(which(abund_mean > 1e-4))
+  count_tab = count_tab %>% select(all_of(micro_sel))
+  data16s = cbind(data16s, decostand(count_tab, 'clr', 1, pseudocount = 1))
+}
+# 并行分析差异
+# library(doParallel)
+micro_name = intersect(micro_info$ID, names(data16s))
+cov_name = c('age', 'BMI_prep', 'smk', 'drk', 'edu')
+cl <- makeCluster(getOption("cl.cores", 8))
+registerDoParallel(cl)
+diff_tab = foreach(microi=micro_name, .packages = c('stringr'),
+                   .combine = rbind) %dopar% my.logistic(microi, 'ICP', cov_name, data16s)
+stopCluster(cl)
+rownames(diff_tab) = NULL
+diff_tab = data.frame(diff_tab)
+names(diff_tab) = c('micro_name','beta','pv')
+diff_tab = diff_tab %>% mutate_at(c('beta','pv'), as.numeric) %>% arrange(pv)
+# 多重检验矫正
+diff_tab$pv_adj_FWER = p.adjust(diff_tab$pv, 'bonferroni')
+diff_tab$pv_adj_FDR = p.adjust(diff_tab$pv, 'fdr')
+diff_tab$abs_beta = abs(diff_tab$beta)
+# 补充物种名称信息
+diff_tab = diff_tab %>% left_join(micro_info, by=c('micro_name'='ID'))
+
+# 也保存分不同level做多重检验矫正的结果
+diff_micro <- createWorkbook()
+addWorksheet(diff_micro, sheetName = "diff_micro_all", gridLines = TRUE)
+writeDataTable(diff_micro, sheet = 1, x = diff_tab, colNames = TRUE, rowNames = FALSE, 
+               withFilter = openxlsx_getOp("withFilter", FALSE), tableStyle = 'none')
+
+p16S = diff_tab %>% filter(str_detect(micro_name,'p\\d+'))
+p16S$pv_adj_FWER = p.adjust(p16S$pv, 'bonferroni')
+p16S$pv_adj_FDR = p.adjust(p16S$pv, 'fdr')
+addWorksheet(diff_micro, sheetName = "diff_micro_phylum", gridLines = TRUE)
+writeDataTable(diff_micro, sheet = 2, x = p16S, colNames = TRUE, rowNames = FALSE, 
+               withFilter = openxlsx_getOp("withFilter", FALSE), tableStyle = 'none')
+
+c16S = diff_tab %>% filter(str_detect(micro_name,'c\\d+'))
+c16S$pv_adj_FWER = p.adjust(c16S$pv, 'bonferroni')
+c16S$pv_adj_FDR = p.adjust(c16S$pv, 'fdr')
+addWorksheet(diff_micro, sheetName = "diff_micro_class", gridLines = TRUE)
+writeDataTable(diff_micro, sheet = 3, x = c16S, colNames = TRUE, rowNames = FALSE, 
+               withFilter = openxlsx_getOp("withFilter", FALSE), tableStyle = 'none')
+
+o16S = diff_tab %>% filter(str_detect(micro_name,'o\\d+'))
+o16S$pv_adj_FWER = p.adjust(o16S$pv, 'bonferroni')
+o16S$pv_adj_FDR = p.adjust(o16S$pv, 'fdr')
+addWorksheet(diff_micro, sheetName = "diff_micro_order", gridLines = TRUE)
+writeDataTable(diff_micro, sheet = 4, x = o16S, colNames = TRUE, rowNames = FALSE, 
+               withFilter = openxlsx_getOp("withFilter", FALSE), tableStyle = 'none')
+
+f16S = diff_tab %>% filter(str_detect(micro_name,'f\\d+'))
+f16S$pv_adj_FWER = p.adjust(f16S$pv, 'bonferroni')
+f16S$pv_adj_FDR = p.adjust(f16S$pv, 'fdr')
+addWorksheet(diff_micro, sheetName = "diff_micro_family", gridLines = TRUE)
+writeDataTable(diff_micro, sheet = 5, x = f16S, colNames = TRUE, rowNames = FALSE,
+               withFilter = openxlsx_getOp("withFilter", FALSE), tableStyle = 'none')
+
+g16S = diff_tab %>% filter(str_detect(micro_name,'g\\d+'))
+g16S$pv_adj_FWER = p.adjust(g16S$pv, 'bonferroni')
+g16S$pv_adj_FDR = p.adjust(g16S$pv, 'fdr')
+addWorksheet(diff_micro, sheetName = "diff_micro_genus", gridLines = TRUE)
+writeDataTable(diff_micro, sheet = 6, x = g16S, colNames = TRUE, rowNames = FALSE, 
+               withFilter = openxlsx_getOp("withFilter", FALSE), tableStyle = 'none')
+
+saveWorkbook(diff_micro, file = 'results/Diff_micro_5level_ICP.xlsx', overwrite = T)
+```
+
+```{r fig.height = 4, fig.width = 6, fig.align = 'center'}
+# 火山图
+df = rbind(p16S, c16S, o16S, f16S, g16S)
+cut.pv = 0.05 # p值截断
+cut.beta = 0.05 # beta值截断
+df = df %>% mutate(col = case_when(pv_adj_FDR < cut.pv & beta > cut.beta ~ 'up',
+                                         pv_adj_FDR < cut.pv & beta < -cut.beta ~ 'down', 
+                                         .default = 'notsig'),
+                         text = case_when(pv_adj_FDR < cut.pv & abs_beta > cut.beta ~ name,
+                                          .default = NA))
+df$level = factor(df$level, levels = unique(df$level))
+ggplot(df, aes(x=beta, y= -log10(pv_adj_FDR)))+
+  facet_wrap(~level)+
+  geom_hline(yintercept = -log10(cut.pv), lty = 2, color = 'grey50')+
+  geom_vline(xintercept = c(-cut.beta, cut.beta), lty = 2, color = 'grey50')+
+  geom_point(aes(color = col), shape = 16, size = 2)+
+  geom_text_repel(aes(label=text), size = 2.5)+
+  scale_color_manual(values = c("coral", "lightblue", "grey80"),
+                     breaks = c("up", 'down' ,'nosig'))+
+  scale_x_continuous(limits = c(-0.3, 0.3), breaks = round(seq(-0.3,0.3,0.1),1))+
+  scale_y_continuous(limits = c(0, 4), breaks = seq(0,4,1))+
+  labs(x='Beta',y='-Log10(adjusted p value)')+
+  theme_bw()+
+  theme(plot.title = element_text(hjust = 0.5),
+        legend.position = 'none',
+        panel.grid= element_blank())
+```
+
+## 多维统计
+
+单维统计中每次纳入一个微生物，多维统计中一次纳入多个微生物，某种程度上考虑了微生物间的相关性。
+
+这里介绍3种常见的分析方法，实际上大多数预测模型都可用于该分析。
+
+-   LDA（linear discriminant analysis，线性判别分析）：最大化组间距离，最小化组内方差。原理可参考：[LDA原理](https://zhuanlan.zhihu.com/p/79696530)。常见的LEFse就是结合了单维统计方法（如Kruskal-Wallis、Wilcox test）和LDA的分析方式。
+- **OPLS-DA**（正交偏最小二乘-判别分析）：结合了降维和判别分析。
+-   LASSO：在线性回归/广义线性模型的基础上增加L1惩罚（回归系数的绝对值之和），达到估计结果中一些变量的回归系数为0的效果。需要调整惩罚倍数$\lambda$，一般而言$\lambda$越大，回归系数为0的数量越多。
+-   Elastic net：在线性回归/广义线性模型的基础上增加L1和L2惩罚（回归系数的平方和），可使估计结果中一些变量的回归系数为0，同时更稳定。除惩罚倍数$\lambda$外，还需调整L1和L2惩罚的“比例”$\alpha$。$\alpha=1$时只有L1惩罚，$\alpha=0$时只有L2惩罚。
+
+因为单维logistic回归中显著的属不多，此处使用回归系数绝对值\>0.05的属进行分析。
+```{r}
+# 筛选物种，数据变换
+count_tab = otu_tab %>% select(matches('^g\\d+'))
+abund_mean = colMeans(decostand(count_tab, 'total', 1))
+micro_sel = names(which(abund_mean > 1e-4)) # 147
+count_tab = count_tab %>% select(all_of(micro_sel))
+clr_tab = decostand(count_tab, 'clr', 1, pseudocount = 1) # clr
+data16s = cbind(explan_var, clr_tab)
+
+# 选择logistic回归系数绝对值>0.05的进一步分析
+micro_sel = g16S %>% filter(abs_beta>0.05) %>% pull(micro_name) # 39
+rule = as.formula(paste0('ICP~', str_flatten(micro_sel,'+'))) # 也可加入协变量
+```
+
+### LDA
+使用`MASS::lda()`进行分析，不建议导入`MASS`包，因为它的`select()`函数与`dplyr`冲突。该方法无p值，绘图可结合单维分析中的p值。
+```{r}
+lda_fit = MASS::lda(rule, data16s)
+lda_coef = data.frame(coef(lda_fit)) # 获得回归系数
+lda_coef$ID = rownames(lda_coef)
+lda_coef$abs_LD1 = abs(lda_coef$LD1)
+# 选择系数>0.1的 # p-value是由单维分析提供的，可结合绘图
+lda_coef_sel = lda_coef %>% filter(abs_LD1 > 0.1) %>% 
+  arrange(desc(LD1)) %>% mutate(col = ifelse(LD1>0, 'up', 'down')) %>% 
+  left_join(micro_info, by='ID')
+lda_coef_sel$name = factor(lda_coef_sel$name, levels = lda_coef_sel$name)
+# 绘制条形图
+ggplot(lda_coef_sel, aes(x = name, y = LD1))+
+  geom_col(aes(fill = col))+
+  coord_flip()+
+  labs(x='', y = 'LDA score', fill = '')+
+  theme_classic()
+```
+
+### (O)PLS-DA
+使用`ropls`包进行分析，提取一个预测成分，一个正交的成分。
+```{r}
+# BiocManager::install('ropls')
+library(ropls)
+X = as.matrix(data16s %>% select(all_of(micro_sel)))
+Y = data16s$ICP
+# 设置1个orthogonal components
+# 注意评价R2X，R2Y和Q2Y
+opls_fit = opls(X, Y, predI = 1, orthoI = 1, fig.pdfC = 'none')
+```
+
+评价模型的预测参数有`R2X`、`R2Y`和`Q2Y`，其中`R2X`和`R2Y`分别表示所建模型对 X 和Y 矩阵的解释率，`Q2Y`表示模型的预测能力，这三个指标越接近于1时表示模型越稳定可靠。`Q2Y`\> 0.5 时可认为是有效的模型，`Q2Y`\> 0.9 时为出色的模型。输入`opls_fit@modelDF`可查看各轴的解释度。
+
+可以绘图展示对Y的分离效果，(O)PLS-DA也是一种限制性排序方法。
+
+```{r fig.width=6.5, fig.height=5.5, fig.align = 'center'}
+# 提取各轴对X的解释度
+contr = sprintf('(%.1f%%)',opls_fit@modelDF[1:2,1] *100)
+# 绘图展示分离效果
+df = data.frame(ICP = factor(Y), opls_fit@scoreMN, opls_fit@orthoScoreMN)
+ptColors = c("#1597A5","#FFC24B")
+ggplot(df, aes(x=p1,y=o1, color=ICP, shape=ICP))+
+  geom_point(size=3, alpha = 0.6)+
+  geom_vline(xintercept = 0,lty="dashed",color="red")+
+  geom_hline(yintercept = 0,lty="dashed",color="red")+
+  stat_ellipse(aes(fill=ICP), geom = "polygon",level = 0.95,
+               linetype = 2,size=0.5, alpha=0.2)+
+  scale_color_manual(values = ptColors)+
+  scale_fill_manual(values = ptColors)+
+  labs(x=paste0("T score1",contr[1]), y=paste0("Orthogonal T score1 ",contr[2]))+
+  theme_bw()+theme(panel.grid = element_blank())
+```
+提取X的对预测的重要性评分，选择排序前15的绘图。
+```{r}
+vipx = data.frame(vip = opls_fit@vipVn)
+vipx$ID = rownames(vipx)
+vipx = vipx %>% arrange(desc(vip)) %>% 
+  left_join(micro_info, by='ID') %>% head(15)
+vipx$name = factor(vipx$name, levels = rev(vipx$name))
+ggplot(vipx, aes(x = name, y = vip))+
+  geom_col(fill = '#3B5998')+
+  coord_flip()+
+  labs(x='', y = 'VIP score', fill = '')+
+  theme_classic()
+```
+
+
+### LASSO
+使用`glmnet`包自带的`cv.glmnet()`选择$\lambda$。选择非零系数绘图。
+
+```{r }
+# library(glmnet)
+X = as.matrix(data16s %>% select(all_of(micro_sel)))
+Y = data16s$ICP
+lasso_fit = cv.glmnet(X, Y, family = binomial, nfolds = 10)
+# plot(lasso_fit)
+# 获得最优lambda时的回归系数
+lasso_coef = coef(lasso_fit, s = lasso_fit$lambda.min)
+lasso_coef = data.frame(beta = as.matrix(lasso_coef[-1,]))
+lasso_coef$ID = rownames(lasso_coef)
+lasso_coef$abs_beta = abs(lasso_coef$beta)
+# 选择非0 / > threshold 的系数绘图 # p-value是由单维分析提供
+lasso_coef_sel = lasso_coef %>% filter(abs_beta > 0) %>% 
+  arrange(desc(beta)) %>% mutate(col = ifelse(beta>0, 'up', 'down')) %>% 
+  left_join(micro_info, by='ID')
+lasso_coef_sel$name = factor(lasso_coef_sel$name, levels = lasso_coef_sel$name)
+# 绘制条形图
+ggplot(lasso_coef_sel, aes(x = name, y = beta))+
+  geom_col(aes(fill = col))+
+  coord_flip()+
+  labs(x='', y = 'LASSO coefficient', fill = '')+
+  theme_classic()
+```
+
+### Elastic net
+使用`caret`包同时调整$\lambda$和$\alpha$。
+```{r collapse=TRUE}
+# library(caret)
+# 分类变量修改为可作为变量名的字符串
+data16s$ICP = factor(data16s$ICP, labels = c('control','case'), levels = 0:1)
+# 设置调参空间
+# 参考LASSO最优lambda设置范围，alpha取值[0,1]
+glmnetGrid <-  expand.grid(lambda = seq(1e-5, 5, length.out = 50),
+                           alpha = seq(0, 1, 0.1)) # 500个组合
+# 考虑运行时间使用了5-fold交叉验证
+fitControl = trainControl(method = "cv", number = 5, verboseIter = F, 
+                          classProbs = TRUE, summaryFunction = twoClassSummary,
+                          allowParallel = F)
+caret_enet = train(rule, data = data16s, method="glmnet", tuneGrid = glmnetGrid,
+                   trControl=fitControl, metric = 'ROC')
+# 最优参数组合
+caret_enet$bestTune
+# 获得最优参数组合的回归系数
+enet_coef = coef.glmnet(caret_enet$finalModel, s = caret_enet$bestTune$lambda)
+enet_coef = data.frame(beta = as.matrix(enet_coef[-1,]))
+enet_coef$ID = rownames(enet_coef)
+enet_coef$abs_beta = abs(enet_coef$beta)
+# 选择 > 0.02 的系数绘图 # p-value是由单维分析提供
+enet_coef_sel = enet_coef %>% filter(abs_beta > 0.02) %>% 
+  arrange(desc(beta)) %>% mutate(col = ifelse(beta>0, 'up', 'down')) %>% 
+  left_join(micro_info, by='ID')
+enet_coef_sel$name = factor(enet_coef_sel$name, levels = enet_coef_sel$name)
+# 绘制条形图
+ggplot(enet_coef_sel, aes(x = name, y = beta))+
+  geom_col(aes(fill = col))+
+  coord_flip()+
+  labs(x='', y = 'Elastic net coefficient', fill = '')+
+  theme_classic()
+```
+
+
+
+
+# 预测模型
+R语言中推荐使用`caret`包，可参考：[caret电子书](https://topepo.github.io/caret/index.html)
+
+该部分不讲机器学习方法的原理，原理网上教程很多，请自行搜索参考。以下列出了常用的方法，大家在使用中需要知道**可调整的参数**的含义：
+
+- LASSO / Elastic net
+- SVM
+- Random forest：调整参数的方法见：[基于Caret进行随机森林调参](https://zhuanlan.zhihu.com/p/352793220)
+- XGBoost
+
+机器学习步骤一般可分为以下几步：
+
+-  数据预处理：差异分析中的数据变换
+-  特征选择：差异分析的单维/多维统计
+-  划分数据：划分为训练集和测试集，如果有外部验证集最好
+-  训练和调参：在训练集上调整模型超参数，拟合出最优模型
+-  预测和评价：在测试集/验证集中预测，并评价预测效果
+-  解释模型：有时可提取特征重要性
+
+以下使用基线变量和/或孕早期菌群数据预测ICP，仅展示一种流程，也有其他流程。
+
+## 数据预处理
+使用CLR变换的数据，当然，其他数据变换也可用。
+```{r}
+count_tab = otu_tab %>% select(matches('^g\\d+'))
+abund_mean = colMeans(decostand(count_tab, 'total', 1))
+micro_sel = names(which(abund_mean > 1e-4)) # 147
+count_tab = count_tab %>% select(all_of(micro_sel))
+clr_tab = decostand(count_tab, 'clr', 1, pseudocount = 1) # clr
+data16s = cbind(explan_var, clr_tab)
+# 分类变量修改为可作为变量名的字符串
+data16s$ICP = factor(data16s$ICP, labels = c('control','case'), levels = 0:1)
+```
+
+## 特征选择
+考虑3种特征集：
+
+1. 仅基线变量
+2. 仅差异微生物，此处选择logistic回归系数绝对值\>0.05的
+3. 两者组合
+
+```{r}
+cov_name = c('age', 'BMI_prep', 'smk', 'drk', 'edu')
+g16S = read.xlsx('results/Diff_micro_5level_ICP.xlsx', sheet = 6)
+micro_sel = g16S %>% filter(abs_beta>0.05) %>% pull(micro_name) # 39
+ft_list = list(type1 = cov_name, type2 = micro_sel,
+               type3 = c(cov_name, micro_sel))
+```
+
+## 划分数据
+```{r}
+set.seed(1111)
+# 7:3划分为训练集和测试集
+train_idx = data16s$ICP %>% createDataPartition(p = 0.7, list = FALSE)
+train_df = data16s[train_idx,]
+test_df = data16s[-train_idx,]
+```
+
+## 训练和调参
+初步尝试了弹性网、随机森林和XGBoost，弹性网效果尚可，且训练速度很快。使用网格调参法，设置了550对参数组合。下方以**3.两者组合**的特征集为例，进行训练和调参。调参方法选择5折交叉验证，指标选择ROC-AUC。
+```{r}
+# 使用glmnet模型，网格调参
+glmnetGrid = expand.grid(lambda = seq(1e-5, 2, length.out = 50),
+                           alpha = seq(0, 0.5, 0.05))
+# 考虑运行时间使用了5-fold交叉验证
+fitControl = trainControl(method = "cv", number = 5, verboseIter = F,
+                          classProbs = TRUE, summaryFunction = twoClassSummary,
+                          search = "grid", allowParallel = F)
+type = 'type3' # 可把type改为循环变量，选择不同特征集
+rule = as.formula(paste0('ICP~', str_flatten(ft_list[[type]], '+')))
+caret_glmnet = train(rule, data = train_df, method="glmnet", tuneGrid = glmnetGrid,
+                 trControl=fitControl, metric = 'ROC')
+```
+
+也提供XGBoost的代码，但其参数较多，运行时间长。
+```{r eval=FALSE}
+# 使用XGBoost模型，网格调参，并行
+cl <- makeCluster(8)
+registerDoParallel(cl)
+# 考虑运行时间这里用了比较粗的网格 144种参数组合
+xgbGrid = expand.grid(nrounds = 500,
+                      max_depth = c(3, 5, 7),
+                      eta = c(0.1, 0.3),
+                      gamma = c(0, 0.5, 1),
+                      colsample_bytree = c(0.8, 1),
+                      min_child_weight = c(1, 3),
+                      subsample = c(0.8, 1))
+# 考虑运行时间使用了5-fold交叉验证
+fitControl = trainControl(method = "cv", number = 5, verboseIter = T,
+                          classProbs = TRUE, summaryFunction = twoClassSummary,
+                          search = 'grid', allowParallel = T)
+type = 'type3' # 可把type改为循环变量
+rule = as.formula(paste0('ICP~', str_flatten(ft_list[[type]], '+')))
+caret_xgb = train(rule, data = train_df, method="xgbTree", tuneGrid = xgbGrid,
+                  trControl=fitControl, metric = 'ROC', verbosity = 0)
+stopCluster(cl)
+plot(caret_xgb)
+```
+
+`caret`包将选择的最优参数组合用于整个训练集，拟合得到最终模型`$finalModel`。
+
+## 预测和评价
+
+使用`pROC`包评价AUC。
+```{r collapse=TRUE}
+# library(pROC)
+y_pred = predict(caret_glmnet, newdata = test_df, type = "prob")
+roc_auc = roc(test_df$ICP, y_pred$case, direction = '<',
+              levels = c('control','case'))
+auc(roc_auc)
+ci(roc_auc)
+```
+
+绘制带灵敏度95%置信区间的ROC曲线。
+
+```{r}
+ci_obj = data.frame(ci.se(roc_auc, specificities = seq(0, 1, 0.02)))
+ci_obj$spe = as.numeric(rownames(ci_obj))
+ggroc(roc_auc, legacy.axes = TRUE, color = 'red')+
+  geom_ribbon(aes(x = 1-spe, ymin = X2.5. , ymax = X97.5.),
+              data = ci_obj, fill = 'red', alpha = 0.2)+
+  scale_x_continuous(expand = c(0,0))+
+  scale_y_continuous(expand = c(0,0))+
+  geom_abline(slope = 1, intercept = 0, color='grey70', linetype = 2)+
+  annotate(geom = 'text', x = 0.73, y = 0.15, label = sprintf('AUC %.2f (%.2f~%.2f)', auc(roc_auc), ci(roc_auc)[1], ci(roc_auc)[3]))+
+  coord_fixed() + theme_bw() + theme(panel.grid = element_blank())
+```
+
+## 解释模型
+在`caret::varImp()`可提取大多数模型的相对重要性（重要性最大值调整为100）。
+```{r}
+# 提取重要性相对值
+vipx_relative = varImp(caret_glmnet)
+```
+
+不同模型类型，有相应的变量重要性指标，可在`$finalModel`中找。如glmnet的重要性是回归系数，random forest的重要性 Mean Decrease Gini等。
+
