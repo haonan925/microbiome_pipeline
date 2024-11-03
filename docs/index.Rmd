@@ -17,6 +17,9 @@ pkgdown:
 
 ```{r setup, include=FALSE}
 knitr::opts_chunk$set(echo = TRUE, warning = FALSE)
+# 设置工作目录
+knitr::opts_knit$set(root.dir = "D:/SCULEAP/微生物组学习资料/mypipeline/")
+Sys.setlocale(category = "LC_ALL", locale = "Chinese (Simplified)_China.utf8")
 ```
 
 # 前言 {.unnumbered}
@@ -28,15 +31,22 @@ knitr::opts_chunk$set(echo = TRUE, warning = FALSE)
 -   dplyr 数据清洗
 -   reshape2 数据重塑
 -   stringr 字符串处理
--   ggplot2 绘图
--   ggrepel 标注文本
--   plot3D 绘图3d
 -   vegan 微生物群落分析
 -   caret 机器学习
 -   glmnet 弹性网和LASSO
 -   pROC 预测评价
 -   doParallel 并行计算**（windows）**
+-   ppcor 偏相关计算
+-   cocor 相关系数检验
 -   openxlsx 读取Excel文件
+-   ggplot2 绘图
+-   ggrepel 标注文本
+-   ggraph/igraph/tidygraph 网络图
+-   ggtree 树状图
+-   circlize 弦图
+-   ComplexHeatmap 聚类热图和绘制单独图例
+-   plot3D 绘图3d
+-   patchwork 拼图
 
 编译本教程所用的R软件环境：
 
@@ -538,6 +548,7 @@ permutest(dispersion, permutations = 999) # 置换检验得到p值
 目的是找到与结局密切相关的微生物，在分析前常进行数据变换。更多介绍可参考：[微生物数据变换与差异分析](https://www.nature.com/articles/s41522-020-00160-w)
 
 本节将使用孕早期所有batch的数据，筛选ICP有关的差异微生物。
+
 ```{r collapse=TRUE}
 otu_tab = read.xlsx('data/物种注释16S（早期+三期）.xlsx') %>% filter(period=='V1')
 micro_info = read.xlsx('data/菌群基本信息16S.xlsx')
@@ -546,7 +557,7 @@ count_tab = otu_tab %>% select(matches('^g\\d+'))
 # 计算相对丰度均值，筛选物种
 abund_mean = colMeans(decostand(count_tab, 'total', 1))
 micro_sel = names(which(abund_mean > 1e-4)) # 147
-count_tab = count_tab %>% select(all_of(micro_sel1))
+count_tab = count_tab %>% select(all_of(micro_sel))
 # 读取ICP诊断和部分协变量的数据
 base_info = readRDS('data/ICP_baseline_info.rds')
 explan_var = otu_tab %>% select(id, period) %>% 
@@ -564,18 +575,20 @@ explan_var = explan_var %>% mutate_at(c('age', 'BMI_prep'), Hmisc::impute, fun=m
 常见的数据变换方式有：
 
 -   相对丰度：使用相对丰度直接分析。
+
 -   **CLR（centered log ratio，中心对数比）变换**：$$clr(x_i) = \log \frac{x_i}{g(\mathbb x)}$$ 其中$\mathbb x$表示计数矩阵，$g(\mathbb x)$为$\mathbb x$的几何均数。如果存在0值，一般的处理方法是计数矩阵每个位置+1。
+
 -   robust CLR变换：$$rclr(x_i) = \log \frac{x_i}{g_{>0}(\mathbb x)}$$ 其中$g_{>0}(\mathbb x)$为$\mathbb x$中大于0的部分的几何均数。如果存在0值，rlcr变换的结果定义为0（相当于将计数表中的0填补为几何均数）。
+
 -   arcsin变换： $$
     \arcsin (p_i)
-    $$
-    其中$p_i$为OTU $i$的相对丰度。 
+    $$ 其中$p_i$为OTU $i$的相对丰度。
 
-- arcsin square root变换： $$
-  \arcsin (\sqrt p_i)
-  $$ 
-  
-- log Z 变换：常见于代谢组和蛋白组。
+-   arcsin square root变换： $$
+    \arcsin (\sqrt p_i)
+    $$
+
+-   log Z 变换：常见于代谢组和蛋白组。
 
 ```{r}
 abund_tab = decostand(count_tab, 'total', 1) # 相对丰度
@@ -586,6 +599,7 @@ asin_sqrt = asin(sqrt(abund_tab)) # arcsin square root
 ```
 
 需要注意`compositions`包的`clr()`在数据存在0时为rclr，不存在0时为clr。
+
 ```{r collapse=TRUE}
 clr_tab2 = compositions::clr(count_tab+1)
 range(clr_tab - as.matrix(clr_tab2)) # 一致
@@ -593,14 +607,14 @@ rclr_tab2 = compositions::clr(count_tab)
 range(rclr_tab - as.matrix(rclr_tab2)) # 一致
 ```
 
-
 ## 单维统计
 
-经过数据变换后，将每个微生物作为暴露因素，考虑**数据类型**和**研究设计**，进行常规的流行病学分析。 
+经过数据变换后，将每个微生物作为暴露因素，考虑**数据类型**和**研究设计**，进行常规的流行病学分析。
 
 这里以clr变换的结果为例，忽略选择偏倚，给出**非配对**数据的t检验、wilcoxon秩和检验与logistic回归的例子。*鼓励大家选择更多分析方法*。
 
 将检验方法整理为函数，便于修改检验方法或并行程序。
+
 ```{r}
 my.t.test <- function(expo, outcome, data){
   rule = paste(expo,'~', outcome)
@@ -627,6 +641,7 @@ my.logistic <- function(expo, outcome, cov_name, data){
 ```
 
 我们主要展示logistic回归的结果。
+
 ```{r collapse=TRUE}
 data16s = cbind(explan_var, clr_tab) # 也可尝试其他变换
 micro_name = colnames(clr_tab)
@@ -651,6 +666,7 @@ diff_tab = diff_tab %>% left_join(micro_info, by=c('micro_name'='ID'))
 ```
 
 常见的描述差异微生物的方式为火山图，但也有很多其他图形绘制，多看文章。
+
 ```{r fig.height = 4, fig.width = 4, fig.align = 'center'}
 cut.pv = 0.05 # p值截断
 cut.beta = 0.05 # beta值截断
@@ -677,6 +693,7 @@ ggplot(df, aes(x=beta, y= -log10(pv_adj_FDR)))+
 ```
 
 下方使用所有level的微生物数据进行分析，并保存结果在同一个excel文件。注意`foreach`并行仅在windows系统中有效。程序较长，可点右侧**hide**跳过。
+
 ```{r}
 # 筛选物种，数据变换
 data16s = explan_var
@@ -786,11 +803,12 @@ ggplot(df, aes(x=beta, y= -log10(pv_adj_FDR)))+
 这里介绍3种常见的分析方法，实际上大多数预测模型都可用于该分析。
 
 -   LDA（linear discriminant analysis，线性判别分析）：最大化组间距离，最小化组内方差。原理可参考：[LDA原理](https://zhuanlan.zhihu.com/p/79696530)。常见的LEFse就是结合了单维统计方法（如Kruskal-Wallis、Wilcox test）和LDA的分析方式。
-- **OPLS-DA**（正交偏最小二乘-判别分析）：结合了降维和判别分析。
+-   **OPLS-DA**（正交偏最小二乘-判别分析）：结合了降维和判别分析。
 -   LASSO：在线性回归/广义线性模型的基础上增加L1惩罚（回归系数的绝对值之和），达到估计结果中一些变量的回归系数为0的效果。需要调整惩罚倍数$\lambda$，一般而言$\lambda$越大，回归系数为0的数量越多。
--   Elastic net：在线性回归/广义线性模型的基础上增加L1和L2惩罚（回归系数的平方和），可使估计结果中一些变量的回归系数为0，同时更稳定。除惩罚倍数$\lambda$外，还需调整L1和L2惩罚的“比例”$\alpha$。$\alpha=1$时只有L1惩罚，$\alpha=0$时只有L2惩罚。
+-   Elastic net：在线性回归/广义线性模型的基础上增加L1和L2惩罚（回归系数的平方和），可使估计结果中一些变量的回归系数为0，同时更稳定。除惩罚倍数$\lambda$外，还需调整L1和L2惩罚的"比例"$\alpha$。$\alpha=1$时只有L1惩罚，$\alpha=0$时只有L2惩罚。
 
 因为单维logistic回归中显著的属不多，此处使用回归系数绝对值\>0.05的属进行分析。
+
 ```{r}
 # 筛选物种，数据变换
 count_tab = otu_tab %>% select(matches('^g\\d+'))
@@ -806,7 +824,9 @@ rule = as.formula(paste0('ICP~', str_flatten(micro_sel,'+'))) # 也可加入协�
 ```
 
 ### LDA
+
 使用`MASS::lda()`进行分析，不建议导入`MASS`包，因为它的`select()`函数与`dplyr`冲突。该方法无p值，绘图可结合单维分析中的p值。
+
 ```{r}
 lda_fit = MASS::lda(rule, data16s)
 lda_coef = data.frame(coef(lda_fit)) # 获得回归系数
@@ -826,7 +846,9 @@ ggplot(lda_coef_sel, aes(x = name, y = LD1))+
 ```
 
 ### (O)PLS-DA
+
 使用`ropls`包进行分析，提取一个预测成分，一个正交的成分。
+
 ```{r}
 # BiocManager::install('ropls')
 library(ropls)
@@ -858,7 +880,9 @@ ggplot(df, aes(x=p1,y=o1, color=ICP, shape=ICP))+
   labs(x=paste0("T score1",contr[1]), y=paste0("Orthogonal T score1 ",contr[2]))+
   theme_bw()+theme(panel.grid = element_blank())
 ```
+
 提取X的对预测的重要性评分，选择排序前15的绘图。
+
 ```{r}
 vipx = data.frame(vip = opls_fit@vipVn)
 vipx$ID = rownames(vipx)
@@ -872,8 +896,8 @@ ggplot(vipx, aes(x = name, y = vip))+
   theme_classic()
 ```
 
-
 ### LASSO
+
 使用`glmnet`包自带的`cv.glmnet()`选择$\lambda$。选择非零系数绘图。
 
 ```{r }
@@ -901,7 +925,9 @@ ggplot(lasso_coef_sel, aes(x = name, y = beta))+
 ```
 
 ### Elastic net
+
 使用`caret`包同时调整$\lambda$和$\alpha$。
+
 ```{r collapse=TRUE}
 # library(caret)
 # 分类变量修改为可作为变量名的字符串
@@ -936,32 +962,32 @@ ggplot(enet_coef_sel, aes(x = name, y = beta))+
   theme_classic()
 ```
 
-
-
-
 # 预测模型
+
 R语言中推荐使用`caret`包，可参考：[caret电子书](https://topepo.github.io/caret/index.html)
 
 该部分不讲机器学习方法的原理，原理网上教程很多，请自行搜索参考。以下列出了常用的方法，大家在使用中需要知道**可调整的参数**的含义：
 
-- LASSO / Elastic net
-- SVM
-- Random forest：调整参数的方法见：[基于Caret进行随机森林调参](https://zhuanlan.zhihu.com/p/352793220)
-- XGBoost
+-   LASSO / Elastic net
+-   SVM
+-   Random forest：调整参数的方法见：[基于Caret进行随机森林调参](https://zhuanlan.zhihu.com/p/352793220)
+-   XGBoost
 
 机器学习步骤一般可分为以下几步：
 
--  数据预处理：差异分析中的数据变换
--  特征选择：差异分析的单维/多维统计
--  划分数据：划分为训练集和测试集，如果有外部验证集最好
--  训练和调参：在训练集上调整模型超参数，拟合出最优模型
--  预测和评价：在测试集/验证集中预测，并评价预测效果
--  解释模型：有时可提取特征重要性
+-   数据预处理：差异分析中的数据变换
+-   特征选择：差异分析的单维/多维统计
+-   划分数据：划分为训练集和测试集，如果有外部验证集最好
+-   训练和调参：在训练集上调整模型超参数，拟合出最优模型
+-   预测和评价：在测试集/验证集中预测，并评价预测效果
+-   解释模型：有时可提取特征重要性
 
 以下使用基线变量和/或孕早期菌群数据预测ICP，仅展示一种流程，也有其他流程。
 
 ## 数据预处理
+
 使用CLR变换的数据，当然，其他数据变换也可用。
+
 ```{r}
 count_tab = otu_tab %>% select(matches('^g\\d+'))
 abund_mean = colMeans(decostand(count_tab, 'total', 1))
@@ -974,11 +1000,12 @@ data16s$ICP = factor(data16s$ICP, labels = c('control','case'), levels = 0:1)
 ```
 
 ## 特征选择
+
 考虑3种特征集：
 
-1. 仅基线变量
-2. 仅差异微生物，此处选择logistic回归系数绝对值\>0.05的
-3. 两者组合
+1.  仅基线变量
+2.  仅差异微生物，此处选择logistic回归系数绝对值\>0.05的
+3.  两者组合
 
 ```{r}
 cov_name = c('age', 'BMI_prep', 'smk', 'drk', 'edu')
@@ -989,6 +1016,7 @@ ft_list = list(type1 = cov_name, type2 = micro_sel,
 ```
 
 ## 划分数据
+
 ```{r}
 set.seed(1111)
 # 7:3划分为训练集和测试集
@@ -998,7 +1026,9 @@ test_df = data16s[-train_idx,]
 ```
 
 ## 训练和调参
+
 初步尝试了弹性网、随机森林和XGBoost，弹性网效果尚可，且训练速度很快。使用网格调参法，设置了550对参数组合。下方以**3.两者组合**的特征集为例，进行训练和调参。调参方法选择5折交叉验证，指标选择ROC-AUC。
+
 ```{r}
 # 使用glmnet模型，网格调参
 glmnetGrid = expand.grid(lambda = seq(1e-5, 2, length.out = 50),
@@ -1014,6 +1044,7 @@ caret_glmnet = train(rule, data = train_df, method="glmnet", tuneGrid = glmnetGr
 ```
 
 也提供XGBoost的代码，但其参数较多，运行时间长。
+
 ```{r eval=FALSE}
 # 使用XGBoost模型，网格调参，并行
 cl <- makeCluster(8)
@@ -1043,6 +1074,7 @@ plot(caret_xgb)
 ## 预测和评价
 
 使用`pROC`包评价AUC。
+
 ```{r collapse=TRUE}
 # library(pROC)
 y_pred = predict(caret_glmnet, newdata = test_df, type = "prob")
@@ -1068,11 +1100,463 @@ ggroc(roc_auc, legacy.axes = TRUE, color = 'red')+
 ```
 
 ## 解释模型
+
 在`caret::varImp()`可提取大多数模型的相对重要性（重要性最大值调整为100）。
+
 ```{r}
 # 提取重要性相对值
 vipx_relative = varImp(caret_glmnet)
 ```
 
 不同模型类型，有相应的变量重要性指标，可在`$finalModel`中找。如glmnet的重要性是回归系数，random forest的重要性 Mean Decrease Gini等。
+
+# 相关性分析
+
+衡量变量间相关性的方法非常多，前文beta多样性中的 $\text{adonis}\ R^2$、$\text{Mantel}\ r$ 和变量解释度等，以及差异分析中的差异倍数、beta系数和变量重要性等均可认为是一种相关性。因此以下绘图方法也可用于这些数值的展示。
+
+本节将介绍常用的相关系数计算方法，主要为具有**对称性**的线性相关系数，以及常见图形的绘制方法。
+
+## 定义
+
+**边际相关（marginal correlation）：**
+
+-   Pearson correlation：一般用于连续变量
+
+$$
+\text{Pearson}\ \rho = \frac{Cov(X,Y)}{\sqrt{Var(X)Var(Y)}} = \frac{\sum\limits_{i=1}^n(x_i-\bar{x})(y_i-\bar{y})}{\sqrt{\sum\limits_{i=1}^n(x_i-\bar{x})^2 \sum\limits_{i=1}^n(y_i-\bar{y})^2}}
+$$
+
+其中$\bar{x}$和$\bar{y}$分别$x_1\dots x_n$和$y_1\dots y_n$的均值。
+
+-   Spearman correlation：将$X$和$Y$排序，使用秩次计算Pearson correlation，一般用于连续变量
+
+$$
+\text{Spearman}\ \rho =  \frac{\sum\limits_{i=1}^n(R(x_i)-\overline{R(x)})(R(y_i)-\overline{R(y)})}{\sqrt{\sum\limits_{i=1}^n(R(x_i)-\overline{R(x)})^2 \sum\limits_{i=1}^n(R(y_i)-\overline{R(y)})^2}} = 1 - \frac{6\sum\limits_{i=1}^n(R(x_i)-R(y_i))^2}{n(n^2 -1)}
+$$
+
+-   Kendall correlation：排序一致的对数减去排序不一致的对数。一般用于连续变量。有多种版本，此处我们介绍简单的版本，当变量中没有秩次相等的情况时：
+
+$$
+\text{Kendall}\ \tau_a = \frac{\#\text{concordant} - \#\text{discordant}}{n(n-1)/2} = \frac{\sum\limits_{i<j}\text{sgn}(x_i-x_j)\text{sgn}(y_i-y_j)}{n(n-1)/2}
+$$
+
+其中$\text{sgn}(\cdot)$为符号函数。
+
+**偏相关（partial correlation）：** 同样有以上3种相关系数的版本。解释为给定其他变量$Z$时，$X$与$Y$的相关性。可由线性回归的残差或逆协方差矩阵计算得出，详见[偏相关系数计算](https://en.wikipedia.org/wiki/Partial_correlation)。
+
+**重复测量数据的相关系数：**可理解为一种特殊的偏相关系数，在混合线性模型中包含个体的随机截距，使用混合线性模型的残差计算相关系数。
+
+**Mantel r：**衡量两个距离矩阵（如通过变量X和Y计算的样本间距离矩阵）的相关性，见*Beta多样性*章。
+
+## 单组学相关性
+本小节计算部分临床指标间的相关性，不同疾病亚组中孕早期菌群间的相关性，并使用多种图形展示。数据使用孕早期4900人的微生物属相对丰度，疾病选择ICP，其他临床指标选择了基线年龄、BMI、TBA最大值和孕三期的体重增长。
+
+```{r}
+micro_info = read.xlsx('data/菌群基本信息16S.xlsx')
+count_tab = otu_tab %>% select(matches('^g\\d+')) # 选择genus
+abund_mean = colMeans(decostand(count_tab, 'total', 1))
+micro_sel = names(which(abund_mean > 1e-4)) # 147
+count_tab = count_tab %>% select(all_of(micro_sel))
+clr_tab = decostand(count_tab, 'clr', 1, pseudocount = 1) # clr
+
+# 读取ICP诊断和部分协变量的数据
+base_info = readRDS('data/ICP_baseline_info.rds')
+# 计算体重增长
+base_info = base_info %>% mutate(weight_gain_a = weight_a - wt_prep,
+                                 weight_gain_b = weight_b - wt_prep,
+                                 weight_gain_c = weight_c - wt_prep)
+# 合并其余变量
+explan_var = otu_tab %>% select(id, period) %>% 
+  left_join(base_info %>% select(id, ICP, age, BMI_prep, smk, drk, edu, TBA_max, contains('weight_gain')), by='id') %>% 
+  mutate(ICP = ifelse(is.na(ICP), 0, ICP)) # ICP诊断缺失填补为0
+colMeans(is.na(explan_var)) 
+```
+
+中晚期体重增加缺失较多，这里为演示方便仍然用均值填补。
+```{r}
+# 连续变量用均值填补，分类变量用众数(0)填补
+explan_var = explan_var %>% mutate_at(c('age', 'BMI_prep','TBA_max','weight_gain_a', 'weight_gain_b', 'weight_gain_c'), Hmisc::impute, fun=mean) %>% 
+  mutate_at(c('smk', 'drk', 'edu'), Hmisc::impute, 0) %>% 
+  mutate_at(c('age', 'BMI_prep','TBA_max', 'weight_gain_a', 'weight_gain_b', 'weight_gain_c', 'smk', 'drk', 'edu'), as.numeric)
+data16s = cbind(explan_var, clr_tab)
+```
+
+以下提供非重复测量数据的 (偏)相关系数 pearson、spearman和kendall版，适用于计算连续变量间的相关性。注意在计算偏相关系数的函数中，协变量可以与感兴趣的变量重复，函数会自动删除重复的协变量。
+```{r}
+my.cor <- function(var1, var2, data, method = 'pearson'){
+  fit = cor.test(data[,var1], data[,var2], method = method)
+  rho = fit$estimate
+  pv = fit$p.value
+  return(c(var1, var2, rho, pv))
+}
+my.pcor <- function(var1, var2, cov_name, data, method = 'pearson'){
+  cov_name = setdiff(cov_name, c(var1, var2)) # 删除重复变量
+  fit = ppcor::pcor.test(data[,var1], data[,var2], data[,cov_name], method = method)
+  rho = fit[1,'estimate']
+  pv = fit[1,'p.value']
+  return(c(var1, var2, rho, pv))
+}
+```
+
+### 热图
+计算多个临床指标间的spearman偏相关系数，并绘制热图。
+```{r}
+var_list = c('age','BMI_prep', 'weight_gain_a', 'weight_gain_b', 'weight_gain_c','TBA_max') # 给出要计算相关性的变量名
+cor_grid = data.frame(expand.grid(var_list, var_list, stringsAsFactors = F)) %>% 
+  filter(Var1 < Var2) # 由于对称性不重复计算
+
+cov_name = c('age', 'BMI_prep', 'smk', 'drk', 'edu') # 如果与var1/var2有重叠，程序会自动删除重复的
+cl <- makeCluster(getOption("cl.cores", 5))
+registerDoParallel(cl)
+clinic_cor = foreach(i=1:nrow(cor_grid), .packages = c('dplyr','ppcor'), .combine = rbind) %dopar% {
+  # my.cor(cor_grid[i,1], cor_grid[i,2], data16s, 'spearman')
+  my.pcor(cor_grid[i,1], cor_grid[i,2], cov_name, data16s, 'spearman')
+}
+stopCluster(cl)
+rownames(clinic_cor) = NULL
+clinic_cor = data.frame(clinic_cor)
+names(clinic_cor) = c('Var1','Var2','rho','pv')
+clinic_cor = clinic_cor %>% mutate_at(c('rho','pv'), as.numeric) %>% arrange(pv)
+clinic_cor$pv_adj_FWER = p.adjust(clinic_cor$pv, 'bonferroni')
+clinic_cor$pv_adj_FDR = p.adjust(clinic_cor$pv, 'fdr')
+clinic_cor$abs_rho = abs(clinic_cor$rho)
+head(clinic_cor)
+```
+
+绘制热图，只需绘制三角区域，图形细节需要自行调整。
+```{r}
+df = clinic_cor %>% mutate(text = ifelse(pv_adj_FDR<0.05,'*','')) #添加显著性标记
+ggplot(df, aes(x=Var1, y=Var2))+
+  geom_tile(aes(fill=rho))+
+  geom_text(aes(label=text), color='black', size = 5)+
+  scale_fill_gradient2(low="#003366",mid='white',high = '#990033')+
+  scale_x_discrete(position = 'top')+
+  labs(x='',y='',fill='Correlation')+
+  coord_fixed()+
+  theme_minimal() + theme(panel.grid = element_blank())
+```
+
+或绘制气泡热图。
+```{r}
+ggplot(df, aes(x=Var1, y=Var2))+
+  geom_point(aes(fill=rho, size=abs_rho), shape=21, color='grey10',stroke=0.8)+
+  geom_text(aes(label=text), color='white')+
+  scale_fill_gradient2(low="#003366",mid='white',high = '#990033')+
+  scale_size(range = c(2,9))+
+  scale_x_discrete(position = 'top')+
+  labs(x='',y='',fill='Correlation',size='|Correlation|')+
+  coord_fixed()+
+  theme_minimal() + theme(panel.grid = element_blank())
+```
+
+### 热图 + 连线
+该图更适合用于展示单组学相关性+多组学相关性。如热图部分可展示其他临床指标的相关性，连线部分展示该临床指标与某一组学全部变量的Mantel r系数。为展示使用多组变量计算Mantel r系数，此处使用微生物属和微生物科作为两种组学特征。
+
+```{r}
+# install.packages("devtools")
+# devtools::install_github("Hy4m/linkET", force = TRUE)
+library(linkET)
+# 给出每个组学的变量名
+# omic_var = list(omic1 = c('','',''), omic2 = c('','','',''))
+
+# 本例使用微生物属和微生物科作为两种组学特征
+micro_f = otu_tab %>% select(matches('^f\\d+')) # 选择family
+abund_tab_f = decostand(micro_f, 'total', 1)
+micro_f = names(which(colMeans(abund_tab_f) > 1e-4)) # 53
+omic_var = list(Family = micro_f, Genus = micro_sel)
+# 临床指标名
+clinic_var = c('age','BMI_prep', 'weight_gain_a', 'weight_gain_b', 'weight_gain_c','TBA_max')
+
+# 微生物用相对丰度，bray距离；临床指标用实际值，euclidean距离
+# 该函数计算env中每个变量，与spec_select中每组变量的mantel r
+abund_tab = decostand(count_tab, 'total', 1)
+mantel_r = mantel_test(spec = cbind(abund_tab_f, abund_tab), 
+                       env = explan_var[,clinic_var],
+                       spec_select = omic_var,
+                       spec_dist = dist_func(.FUN = "vegdist", method = 'bray'),
+                       env_dist = dist_func(.FUN = "vegdist", method = 'euclidean'),
+                       permutations = 99, parallel = 4) #需修改置换次数
+
+# 设置分组阈值 # 本例相关性很弱，需要根据实际修改分组
+mantel_r = mantel_r %>% mutate(rd = cut(r, breaks = c(-Inf, 0.01, 0.012, Inf),
+                                        labels = c("< 0.01", "0.01 - 0.012", ">= 0.12")),
+                               pd = cut(p, breaks = c(-Inf, 0.05, 0.1, Inf),
+                                        labels = c("< 0.05", "0.05 - 0.1", ">= 0.1")))
+
+```
+
+绘制热图和线图。
+```{r fig.width=7.1, fig.height=5.2, fig.align = 'center'}
+get_cor_mtx <- function(melt_df, value.var = 'rho', diag.value = 1){
+  node = unique(c(melt_df$Var1, melt_df$Var2)) %>% sort
+  node_len = length(node)
+  cor = matrix(0,node_len,node_len)
+  diag(cor) = diag.value
+  for (i in 1:(node_len-1)) {
+    for (j in (i+1):node_len) {
+      idx = which(melt_df$Var1==node[i] & melt_df$Var2==node[j])
+      if (length(idx)==0) next
+      cor[i,j] = cor[j,i] = melt_df[idx, value.var]
+    }
+  }
+  rownames(cor)=colnames(cor)=node
+  cor
+}
+# 整理数据为矩阵
+rho_mtx = get_cor_mtx(clinic_cor, 'rho')
+pv_mtx = get_cor_mtx(clinic_cor, 'pv_adj_FDR', 0)
+cor_mtx = list(r=rho_mtx, p=pv_mtx)
+class(cor_mtx) = "correlate"
+
+qcorrplot(cor_mtx, type = "lower", diag = FALSE) +
+  # 热图方格
+  geom_square()+
+  # 连线
+  geom_couple(aes(colour = pd, size = rd), data = mantel_r, curvature = 0.1,
+              node.colour = c("blue", "blue"), 
+              node.fill = c("grey", "grey"), 
+              node.size = c(3.5, 2.5))+
+  # 调整颜色和线宽
+  scale_fill_gradientn(colours = RColorBrewer::brewer.pal(11, "RdBu"), limits = c(-1, 1), breaks = seq(-1,1,0.5)) +
+  scale_size_manual(values = c(0.5, 1, 1.5, 2)) +
+  scale_colour_manual(values = color_pal(3)) +
+  # 修改图例
+  guides(colour = guide_legend(title = "Mantel's P", override.aes = list(size = 1.5), order = 1),
+         size = guide_legend(title = "Mantel's r", override.aes = list(colour = "grey35"), order = 2),
+         fill = guide_colorbar(title = "Spearman's r", order = 3))
+```
+
+### 亚组分析+网络图
+非重复测量数据的 (偏)相关系数 pearson, spearman, kendall版，可进行亚组分析。注意代码仅适用于两组，用0和1编码。
+```{r}
+my.cor.subgroup <- function(var1, var2, group, data, method = 'pearson'){
+  data0 = data %>% filter(get(group)==0)
+  fit0 = my.cor(var1, var2, data0, method)
+  r0 = as.numeric(fit0[3])
+  pv0 = fit0[4]
+  data1 = data %>% filter(get(group)==1)
+  fit1 = my.cor(var1, var2, data1, method)
+  r1 = as.numeric(fit1[3])
+  pv1 = fit1[4]
+  pv = cocor::cocor.indep.groups(r0,r1,nrow(data0),nrow(data1),test = 'fisher1925')
+  pv = pv@fisher1925$p.value
+  return(c(var1, var2, r0, r1, pv0, pv1, pv))
+}
+my.pcor.subgroup <- function(var1, var2, group, cov_name, data, method = 'pearson'){
+  data0 = data %>% filter(get(group)==0)
+  fit0 = my.pcor(var1, var2, cov_name, data0, method)
+  r0 = as.numeric(fit0[3])
+  pv0 = fit0[4]
+  data1 = data %>% filter(get(group)==1)
+  fit1 = my.pcor(var1, var2, cov_name, data1, method)
+  r1 = as.numeric(fit1[3])
+  pv1 = fit1[4]
+  pv = cocor::cocor.indep.groups(r0,r1,nrow(data0),nrow(data1),test = 'fisher1925')
+  pv = pv@fisher1925$p.value
+  return(c(var1, var2, r0, r1, pv0, pv1, pv))
+}
+```
+
+根据ICP诊断分组，计算全部微生物属的Spearman相关性。
+```{r}
+var_list = micro_sel # 给出要计算相关性的变量名
+cor_grid = data.frame(expand.grid(var_list, var_list, stringsAsFactors = F)) %>% 
+  filter(Var1 < Var2) # 由于对称性不重复计算
+cov_name = c('age', 'BMI_prep', 'smk', 'drk', 'edu') # 如果与var1/var2有重叠，程序会自动删除重复的
+cl <- makeCluster(getOption("cl.cores", 10))
+registerDoParallel(cl)
+subgroup_cor = foreach(i=1:nrow(cor_grid), .packages = c('dplyr','cocor','ppcor'), .combine = rbind) %dopar% {
+  # 亚组分析
+  # my.cor.subgroup(cor_grid[i,1], cor_grid[i,2], 'ICP', data16s, 'spearman')
+  my.pcor.subgroup(cor_grid[i,1], cor_grid[i,2], 'ICP', cov_name, data16s, 'spearman')
+}
+stopCluster(cl)
+rownames(subgroup_cor) = NULL
+subgroup_cor = data.frame(subgroup_cor)
+names(subgroup_cor) = c('Var1','Var2','r0', 'r1', 'pv0', 'pv1', 'pv')
+subgroup_cor = subgroup_cor %>% mutate_at(c('r0', 'r1', 'pv0', 'pv1', 'pv'), as.numeric) %>% arrange(pv)
+subgroup_cor$pv_adj_FWER = p.adjust(subgroup_cor$pv, 'bonferroni')
+subgroup_cor$pv_adj_FDR = p.adjust(subgroup_cor$pv, 'fdr')
+subgroup_cor$abs_delta = abs(subgroup_cor$r0 - subgroup_cor$r1)
+head(subgroup_cor)
+```
+
+使用相关性构建微生物共现网络图，此处提供一种简易绘图模板。
+```{r message=FALSE}
+library(tidygraph)
+library(ggraph)
+library(patchwork)
+
+# summary(abs(subgroup_cor$r0)) # 查看数据范围
+# 整理相关系数符号，设定截断值
+df = subgroup_cor %>% rename(from=Var1, to=Var2) %>% 
+  mutate(sign0 = factor(sign(r0)), sign1 = factor(sign(r1)), cutoff = 0.25)
+# 合并两个网络，用于建立统一布局
+df_01 = rbind(df %>% select(from, to, rho=r0, sign=sign0, cutoff) %>% mutate(class=0),
+              df %>% select(from, to, rho=r1, sign=sign1, cutoff) %>% mutate(class=1))
+# 节点属性表，用于节点绘图
+node_name = data.frame(name = unique(c(df$from, df$to)))
+node_name = node_name %>% left_join(micro_info %>% select(ID, genus_name=name, OTU), by=c('name'='ID')) %>% 
+  mutate(newclass = str_extract(OTU,'p__[^;]*'), newclass = str_remove(newclass, 'p__')) # 可根据门上色
+
+# 大图获得相同布局
+network = igraph::graph_from_data_frame(df_01 %>% filter(abs(rho) > cutoff), directed = F)
+network = as_tbl_graph(network)
+# 0/1图
+network0 = igraph::graph_from_data_frame(df %>% filter(abs(r0) > cutoff), directed = F)
+network0 = as_tbl_graph(network0)
+network1 = igraph::graph_from_data_frame(df %>% filter(abs(r1) > cutoff), directed = F)
+network1 = as_tbl_graph(network1)
+# 计算节点度（重要性）
+network0 = network0 %>% activate(nodes) %>% 
+  mutate(importance0 = centrality_betweenness(),
+         rank0 = rank(-importance0)) %>%  as_tibble()
+network1 = network1 %>% activate(nodes) %>% 
+  mutate(importance1 = centrality_betweenness(),
+         rank1 = rank(-importance1)) %>%  as_tibble()
+# 补充重要性到大图中
+network = network %>% activate(nodes) %>% 
+  left_join(network0) %>% left_join(network1) %>% 
+  left_join(node_name)
+```
+
+```{r}
+# 绘图
+p_name = c("Firmicutes","Actinobacteriota","Bacteroidota","Proteobacteria", "Patescibacteria",
+           "Desulfobacterota","Verrucomicrobiota","Fusobacteriota","Synergistota","Cyanobacteria")
+p_col = RColorBrewer::brewer.pal(10, "Set3")
+
+set.seed(999)
+p0 = ggraph(network, layout = 'graphopt', charge = 0.02, mass=300, spring.length = 1)+
+  geom_edge_fan(aes(color = sign, filter= class==0), alpha = 0.25, width = 0.5)+
+  scale_edge_color_manual(breaks = c('1','-1'), values = c('#F76C6C',"#0a336b"), label=c('positive','negative'), name='Correlation')+
+  geom_node_point(aes(fill = newclass, size = importance0), alpha = 0.9, shape=21, stroke=0.4, color='grey10')+
+  scale_fill_manual(values = p_col, breaks = p_name, guide = guide_legend('Phylum', order=1))+
+  scale_size_continuous(breaks = c(100, 200, 500), limits = c(0,550),
+                        guide = guide_legend(title = 'Betweenness centrality', override.aes = list(fill="grey85", color='grey10', shape=21, stroke=0.4)))+
+  theme_void() + coord_equal()+
+  labs(title = 'ICP-')
+
+set.seed(999)
+p1 = ggraph(network, layout = 'graphopt', charge = 0.02, mass=300, spring.length = 1)+
+  geom_edge_fan(aes(color = sign, filter= class==1), alpha = 0.25, width = 0.5)+
+  scale_edge_color_manual(breaks = c('1','-1'), values = c('#F76C6C',"#0a336b"), label=c('positive','negative'), name='Correlation')+
+  geom_node_point(aes(fill = newclass, size = importance1), alpha = 0.9, shape=21, stroke=0.4, color='grey10')+
+  scale_fill_manual(values = p_col, breaks = p_name, guide = guide_legend('Phylum', order=1))+
+  scale_size_continuous(breaks = c(100, 200, 500), limits = c(0,550),
+                        guide = guide_legend(title = 'Betweenness centrality', override.aes = list(fill="grey85", color='grey10', shape=21, stroke=0.4)))+
+  theme_void() + coord_equal()+
+  labs(title = 'ICP+')
+
+p0 + p1 + plot_layout(guides = 'collect') &
+  theme(plot.title = element_text(hjust = 0.5, size = 12, vjust = 0))
+```
+
+
+## 组学间相关性
+计算方法与单组学相同，绘图方法由同学自学。
+此处计算所有微生物属与临床指标间的相关性。
+
+```{r}
+var_list1 = micro_sel # 给出要计算相关性的变量名
+var_list2 = c('age', 'BMI_prep','TBA_max', 'weight_gain_a', 'weight_gain_b', 'weight_gain_c')
+cor_grid = data.frame(expand.grid(var_list1, var_list2, stringsAsFactors = F))
+
+cov_name = c('age', 'BMI_prep', 'smk', 'drk', 'edu') # 如果与var1/var2有重叠，程序会自动删除重复的
+cl <- makeCluster(getOption("cl.cores", 5))
+registerDoParallel(cl)
+omic_cor = foreach(i=1:nrow(cor_grid), .packages = c('dplyr','ppcor'), .combine = rbind) %dopar% {
+  # my.cor(cor_grid[i,1], cor_grid[i,2], data16s, 'spearman')
+  my.pcor(cor_grid[i,1], cor_grid[i,2], cov_name, data16s, 'spearman')
+}
+stopCluster(cl)
+rownames(omic_cor) = NULL
+omic_cor = data.frame(omic_cor)
+names(omic_cor) = c('Var1','Var2','rho','pv')
+omic_cor = omic_cor %>% mutate_at(c('rho','pv'), as.numeric) %>% arrange(pv)
+omic_cor$pv_adj_FWER = p.adjust(omic_cor$pv, 'bonferroni')
+omic_cor$pv_adj_FDR = p.adjust(omic_cor$pv, 'fdr')
+omic_cor$abs_rho = abs(omic_cor$rho)
+```
+
+
+### 聚类热图
+这里给出一个草图，可参考各种网络资源自学。
+```{r message=FALSE}
+library(ComplexHeatmap)
+df = dcast(data=omic_cor, Var2~Var1, value.var = 'rho')
+rownames(df) = df[,1]
+df = as.matrix(df[,-1])
+```
+```{r}
+Heatmap(df, name='rho')
+```
+
+
+还可绘制弦图，分类树等图形，*见整理文件自学*。
+
+### Procrustes analysis
+
+- Procrustes分析是一种通过分析形状分布，比较两组数据一致性的方法。
+
+- 通过平移、旋转和缩放其中一个数据集中点的坐标以匹配另一数据集中对应点的坐标，并最小化点坐标之间的偏差平方和（记为$M^2$）。
+
+- 若$M^2$足够小，那么认为两组数据的坐标点是相似的。
+
+参考：[Procrustes分析原理](https://en.wikipedia.org/wiki/Procrustes_analysis)，P值可通过置换检验获取。
+
+以下代码比较脂质组和肠道菌群16S属的相似性。
+```{r message=FALSE}
+# 脂质组1086人
+meta_info = read.xlsx('data/代谢物基本信息.xlsx')[,1:10]
+data = readRDS('data/longtab_depression_metabolism_logz_all.rds')
+meta.names = intersect(meta_info %>% filter(islipid==1) %>% pull(Index), names(data))
+data = data %>% select(id, period, all_of(meta.names))
+# 微生物属1086人
+micro_info = read.xlsx('data/菌群基本信息16S.xlsx')
+data16s = read.xlsx('data/物种注释16S（早期+三期）.xlsx') %>% filter(batch==2)
+count_tab = data16s %>% select(matches('^g\\d+')) # 选择genus
+abund_tab = decostand(count_tab, 'total', 1)
+micro_sel = names(which(colMeans(abund_tab) > 1e-4)) # 142
+data16s = cbind(data16s %>% select(id, period), abund_tab[,micro_sel])
+# 合并数据
+data = data %>% left_join(data16s)
+data = data[complete.cases(data),]
+```
+
+首先获取脂质组和菌群各自的降维结果，注意该分析是用于降维后数据的。
+
+```{r collapse=TRUE}
+# 脂质组PCA
+pca_lipid = rda(data %>% select(all_of(meta.names)), scale = TRUE)
+# 菌群PCoA
+bray_dist = vegdist(data %>% select(all_of(micro_sel)), 'bray')
+pcoa_16s = cmdscale(bray_dist, k = 2, eig = TRUE) # 只比较前2维是否相似
+
+# Procrustes分析
+proc = procrustes(pca_lipid, pcoa_16s, symmetric = TRUE)
+summary(proc)
+# M2
+proc$ss
+
+# 置换检验
+set.seed(123)
+proc_pv = protest(X = pca_lipid, Y = pcoa_16s, permutations = 999)
+proc_pv$signif
+
+# 草图
+plot(proc, kind = 1)
+```
+
+样本数过多时，图形不清晰，可考虑不绘制对应样本点连线，或不绘制该图形。
+
+
+
+
+
+
+
+
+
+
 
